@@ -1,0 +1,12 @@
+torch>=2.1
+
+[dev]
+pytest>=7.4
+numpy>=1.24
+requests>=2.31
+
+[scrape]
+requests>=2.31
+
+[train]
+numpy>=1.24

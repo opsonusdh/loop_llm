@@ -1,0 +1,23 @@
+{
+  "checkpoint": "latest.pt",
+  "train_data": "train.bin",
+  "val_data": "train.val.bin",
+  "output_dir": "exit_gate",
+  "data_dtype": "uint16",
+  "batch_size": 3,
+  "seq_len": 320,
+  "max_steps": 701,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "warmup_steps": 100,
+  "sharpness": 50.0,
+  "margin": 0.005,
+  "eval_interval": 100,
+  "checkpoint_interval": 100,
+  "eval_batches": 25,
+  "log_interval": 10,
+  "seed": 42,
+  "device": "dml",
+  "resume": true,
+  "colab": false
+}

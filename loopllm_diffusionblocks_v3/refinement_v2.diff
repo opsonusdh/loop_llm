@@ -1,0 +1,477 @@
+===== model.py =====
+--- /mnt/data/project/model.py	2026-08-20 06:15:38.602750970 +0000
++++ src/loop_transformer/model.py	2026-08-20 06:26:32.421118765 +0000
+@@ -24,7 +24,7 @@
+ from __future__ import annotations
+ 
+ import warnings
+-from typing import List, Optional, Tuple
++from typing import Dict, List, Optional, Tuple
+ 
+ import torch
+ import torch.nn as nn
+@@ -35,7 +35,7 @@
+ from .attnres import LoopedAttnRes
+ from .block import ExitGate, TransformerBlock
+ from .config import LoopConfig
+-from .layers import RMSNorm
++from .layers import RMSNorm, safe_eps
+ 
+ 
+ class LoopTransformer(nn.Module):
+@@ -78,6 +78,14 @@
+                 csa_m=cfg.csa_m, csa_top_k=cfg.csa_top_k,
+                 hca_m_prime=cfg.hca_m_prime, sw_window=cfg.sw_window,
+                 groups=cfg.groups, group_dim=cfg.group_dim, rope_dim=cfg.rope_dim,
++                moe_num_shared_experts=cfg.moe_num_shared_experts,
++                moe_num_routed_experts=cfg.moe_num_routed_experts,
++                moe_top_k=cfg.moe_top_k,
++                moe_expert_hidden_dim=cfg.moe_expert_hidden_dim,
++                max_loops=cfg.max_loops,
++                activation_balance_weight=cfg.activation_balance_weight,
++                moe_aux_loss_weight=cfg.moe_aux_loss_weight,
++                activation_top_k=cfg.activation_top_k,
+             )
+             for i in range(cfg.n_layers)
+         ])
+@@ -86,7 +94,7 @@
+         self.depth_attn = LoopedAttnRes(cfg.dim, n_sublayers_per_loop=2 * cfg.n_layers)
+ 
+         # Exit gate + LM head -- shared weights across loop steps (LoopLM §4.1)
+-        self.exit_gate  = ExitGate(cfg.dim)
++        self.exit_gate  = ExitGate(cfg.dim, loop_embed_dim=cfg.exit_gate_loop_embed_dim, max_loops=cfg.max_loops)
+         self.final_norm = RMSNorm(cfg.dim)
+ 
+         self.embed_proj_out = (
+@@ -108,6 +116,14 @@
+         # return value from compute_loss() so the existing (total_loss,
+         # step_losses) call signature stays exactly backward compatible.
+         self.last_csa_aux_loss: Optional[torch.Tensor] = None
++        self.last_activation_balance_loss: Optional[torch.Tensor] = None
++        self.last_moe_aux_loss: Optional[torch.Tensor] = None
++        self.last_activation_probs: Optional[torch.Tensor] = None
++        self.last_moe_load: Optional[torch.Tensor] = None
++        self.last_loop_supervision_loss: Optional[torch.Tensor] = None
++        self.last_loop_refinement_loss: Optional[torch.Tensor] = None
++        self.last_loop_task_loss: Optional[torch.Tensor] = None
++        self.last_loop_monotonic_loss: Optional[torch.Tensor] = None
+ 
+     def num_parameters(self, effective: bool = False) -> int:
+         """
+@@ -131,7 +147,7 @@
+     # Internal: one full loop pass
+     # ------------------------------------------------------------------
+ 
+-    def _one_loop_impl(self, *blocks_tuple: torch.Tensor) -> torch.Tensor:
++    def _one_loop_impl(self, loop_idx: int, *blocks_tuple: torch.Tensor) -> torch.Tensor:
+         """
+         Checkpointable core of one loop pass. Identical logic to running
+         through all N blocks once with LoopedAttnRes managing residuals,
+@@ -155,19 +171,19 @@
+ 
+             # ── Attention sub-layer ──────────────────────────────────
+             h_in     = self.depth_attn.compute_input(pos_attn, blocks, partial)
+-            attn_out = block.forward_attn(h_in)
++            attn_out = block.forward_attn(h_in, loop_idx=loop_idx)
+             partial  = attn_out if partial is None else partial + attn_out
+ 
+             # ── FFN sub-layer ────────────────────────────────────────
+             # Note: `partial` now contains the attention output, so the
+             # FFN input implicitly sees it through the AttnRes mixture.
+             h_in    = self.depth_attn.compute_input(pos_ffn, blocks, partial)
+-            ffn_out = block.forward_ffn(h_in)
++            ffn_out = block.forward_ffn(h_in, loop_idx=loop_idx)
+             partial = partial + ffn_out
+ 
+         return partial  # type: ignore[return-value]
+ 
+-    def _one_loop(self, blocks: List[torch.Tensor]) -> torch.Tensor:
++    def _one_loop(self, blocks: List[torch.Tensor], loop_idx: int = 0) -> torch.Tensor:
+         """
+         Run one loop pass, optionally wrapped in gradient checkpointing.
+ 
+@@ -183,8 +199,8 @@
+         max_loops copies of their activations must stay live for backward.
+         """
+         if self.cfg.grad_checkpointing and self.training:
+-            return grad_checkpoint(self._one_loop_impl, *blocks, use_reentrant=False)
+-        return self._one_loop_impl(*blocks)
++            return grad_checkpoint(self._one_loop_impl, loop_idx, *blocks, use_reentrant=False)
++        return self._one_loop_impl(loop_idx, *blocks)
+ 
+     # ------------------------------------------------------------------
+     # Forward
+@@ -204,6 +220,7 @@
+         lambdas     : list of [B] tensors -- instantaneous exit probs λ_t
+         """
+         max_loops = max_loops if max_loops is not None else self.cfg.max_loops
++        self._clear_ffn_aux_losses()
+         embedding = self.tok_emb(idx)
+         if self.embed_proj_in is not None:
+             embedding = self.embed_proj_in(embedding)
+@@ -214,9 +231,9 @@
+         loop_logits: List[torch.Tensor] = []
+         lambdas:     List[torch.Tensor] = []
+ 
+-        for _ in range(max_loops):
++        for loop_idx in range(max_loops):
+             # ── One loop pass through all N blocks ───────────────────
+-            partial = self._one_loop(blocks)
++            partial = self._one_loop(blocks, loop_idx=loop_idx)
+ 
+             # Completed loop → becomes new block-level source b_t
+             blocks.append(partial)
+@@ -228,7 +245,7 @@
+ 
+             pre_logits = self.embed_proj_out(h_normed) if self.embed_proj_out is not None else h_normed
+             loop_logits.append(self.lm_head(pre_logits))
+-            lambdas.append(self.exit_gate(h_normed))  # exit gate always sees the full-width representation
++            lambdas.append(self.exit_gate(h_normed, loop_idx=loop_idx))
+ 
+         return loop_logits, lambdas
+ 
+@@ -294,6 +311,113 @@
+             return torch.zeros((), device=next(self.parameters()).device)
+         return torch.stack(losses).mean()
+ 
++    def _clear_ffn_aux_losses(self) -> None:
++        for module in self.modules():
++            if hasattr(module, "_clear_aux_losses"):
++                module._clear_aux_losses()
++
++    def _collect_ffn_aux_losses(self) -> Tuple[torch.Tensor, torch.Tensor]:
++        activation_losses = []
++        moe_losses = []
++        activation_probs = []
++        moe_loads = []
++        for module in self.modules():
++            if hasattr(module, "collect_aux_loss"):
++                a, m = module.collect_aux_loss()
++                if a.requires_grad:
++                    activation_losses.append(a)
++                if m.requires_grad:
++                    moe_losses.append(m)
++            if hasattr(module, "last_activation_probs_mean"):
++                p = module.last_activation_probs_mean
++                if p is not None:
++                    activation_probs.append(p)
++            if hasattr(module, "last_expert_load"):
++                l = module.last_expert_load
++                if l is not None:
++                    moe_loads.append(l)
++        device = next(self.parameters()).device
++        a = torch.stack(activation_losses).mean() if activation_losses else torch.zeros((), device=device)
++        m = torch.stack(moe_losses).mean() if moe_losses else torch.zeros((), device=device)
++        self.last_activation_balance_loss = a.detach()
++        self.last_moe_aux_loss = m.detach()
++        self.last_activation_probs = torch.stack(activation_probs).mean(dim=0) if activation_probs else None
++        self.last_moe_load = torch.stack(moe_loads).mean(dim=0) if moe_loads else None
++        return a, m
++
++    def get_routing_debug(self) -> Dict[str, Dict[str, object]]:
++        """
++        Snapshot of routing diagnostics from the most recent forward() call,
++        averaged across every FeedForward layer -- what scripts/generate.py's
++        --debug flag prints per generation step.
++
++        Deliberately independent of _collect_ffn_aux_losses()/compute_loss():
++        this only READS each FeedForward's last_* properties (already
++        populated as a side effect of forward() running _route_activations/
++        _run_sparse_routed) and never clears anything, so it's safe to call
++        after a plain forward() or generate() call -- no interaction with
++        training's aux-loss bookkeeping.
++
++        Returns {} if no FeedForward layer has run a forward pass yet
++        (matches generate.py's `if not info: return`).
++        """
++        act_probs, act_hard, act_entropy = [], [], []
++        moe_probs, moe_hard, moe_entropy = [], [], []
++
++        for module in self.modules():
++            if hasattr(module, "last_activation_probs_dense_mean"):
++                p = module.last_activation_probs_dense_mean
++                if p is not None:
++                    act_probs.append(p)
++            if hasattr(module, "last_activation_probs_mean"):
++                p = module.last_activation_probs_mean
++                if p is not None:
++                    act_hard.append(p)
++            if hasattr(module, "last_activation_entropy_mean"):
++                e = module.last_activation_entropy_mean
++                if e is not None:
++                    act_entropy.append(e)
++            if hasattr(module, "last_expert_probs_mean"):
++                p = module.last_expert_probs_mean
++                if p is not None:
++                    moe_probs.append(p)
++            if hasattr(module, "last_expert_load"):
++                l = module.last_expert_load
++                if l is not None:
++                    moe_hard.append(l)
++            if hasattr(module, "last_expert_entropy_mean"):
++                e = module.last_expert_entropy_mean
++                if e is not None:
++                    moe_entropy.append(e)
++
++        info: Dict[str, Dict[str, object]] = {}
++        if act_probs or act_hard or act_entropy:
++            info["activation"] = {
++                "top_k": self.cfg.activation_top_k,
++                "mean_probs": torch.stack(act_probs).mean(dim=0).tolist() if act_probs else None,
++                "hard_usage": torch.stack(act_hard).mean(dim=0).tolist() if act_hard else None,
++                "mean_entropy": torch.stack(act_entropy).mean().item() if act_entropy else None,
++            }
++        if moe_probs or moe_hard or moe_entropy:
++            info["moe"] = {
++                "top_k": self.cfg.moe_top_k,
++                "mean_probs": torch.stack(moe_probs).mean(dim=0).tolist() if moe_probs else None,
++                "hard_usage": torch.stack(moe_hard).mean(dim=0).tolist() if moe_hard else None,
++                "mean_entropy": torch.stack(moe_entropy).mean().item() if moe_entropy else None,
++            }
++        return info
++
++    def clear_routing_debug(self) -> None:
++        """Reset get_routing_debug()'s per-layer snapshot fields so a stale
++        forward pass's numbers can't leak into the next one -- e.g.
++        scripts/generate.py calls this before each new generation step.
++        Mirrors _clear_ffn_aux_losses()'s hasattr-dispatch pattern, but
++        targets the debug-only fields, not the aux-loss lists -- keeps this
++        fully independent of training's loss bookkeeping."""
++        for module in self.modules():
++            if hasattr(module, "_clear_routing_diagnostics"):
++                module._clear_routing_diagnostics()
++
+     def compute_loss(
+         self,
+         idx:       torch.Tensor,
+@@ -402,6 +526,29 @@
+             ).view(B, -1).mean(dim=1)              # [B] -- mean over positions
+             step_losses_per_example.append(ce)
+         step_losses_per_example = torch.stack(step_losses_per_example, dim=1)  # [B, T]
++        primary_step_losses = step_losses_per_example
++
++        # Distinct task per loop, without replacing the primary LM objective.
++        # Loop t predicts t+1 tokens ahead (1-, 2-, 3-, 4-token horizons).
++        # This makes the auxiliary objective genuinely depth-specific while
++        # every loop still receives the normal next-token CE signal.
++        loop_task_loss = torch.zeros((), device=idx.device, dtype=primary_step_losses.dtype)
++        if self.cfg.loop_task_weight > 0 and self.cfg.loop_task_mode == "horizon":
++            task_losses = []
++            for t, logits in enumerate(loop_logits):
++                horizon = t + 1
++                if idx.size(1) <= horizon:
++                    continue
++                pred = logits[:, :-(horizon)].contiguous()
++                tgt = idx[:, horizon:].contiguous()
++                task_losses.append(F.cross_entropy(
++                    pred.reshape(-1, pred.size(-1)), tgt.reshape(-1), reduction="mean"
++                ))
++            if task_losses:
++                w = torch.arange(1, len(task_losses) + 1, device=idx.device, dtype=primary_step_losses.dtype)
++                w = w / w.sum() * len(task_losses)
++                loop_task_loss = torch.stack(task_losses).mul(w).mean()
++        self.last_loop_task_loss = loop_task_loss.detach()
+ 
+         if teacher is not None:
+             teacher_was_training = teacher.training
+@@ -442,14 +589,69 @@
+ 
+         # ── Objective, averaged over the batch ─────────────────────────
+         expected_loss = (p_exit * step_losses_per_example).sum(dim=1).mean()
+-        entropy       = -(p_exit * p_exit.clamp(min=1e-8).log()).sum(dim=1).mean()
++        entropy       = -(p_exit * p_exit.clamp(min=safe_eps(p_exit.dtype)).log()).sum(dim=1).mean()
+         total_loss    = expected_loss - beta * entropy
+ 
++        # Optional direct supervision for every executed loop. The weights
++        # increase linearly with depth and are normalized to sum to one, so
++        # this behaves as an auxiliary objective rather than changing the
++        # loss scale merely because max_loops is larger. The default weight
++        # is 0.0, preserving the original training objective exactly.
++        if self.cfg.loop_supervision_weight > 0.0:
++            n_loops = step_losses_per_example.size(1)
++            loop_weights = torch.arange(
++                1, n_loops + 1,
++                device=step_losses_per_example.device,
++                dtype=step_losses_per_example.dtype,
++            )
++            loop_weights = loop_weights / loop_weights.sum()
++            loop_supervision_loss = (
++                step_losses_per_example * loop_weights.unsqueeze(0)
++            ).sum(dim=1).mean()
++        else:
++            loop_supervision_loss = torch.zeros(
++                (),
++                device=step_losses_per_example.device,
++                dtype=step_losses_per_example.dtype,
++            )
++        self.last_loop_supervision_loss = loop_supervision_loss.detach()
++        total_loss = total_loss + self.cfg.loop_supervision_weight * loop_supervision_loss
++
+         csa_aux_loss = self._collect_csa_aux_loss()
+         self.last_csa_aux_loss = csa_aux_loss.detach()
+         total_loss = total_loss + self.cfg.csa_aux_loss_weight * csa_aux_loss
+ 
+-        return total_loss, step_losses_per_example.mean(dim=0).detach()  # [T]
++        activation_balance_loss, moe_aux_loss = self._collect_ffn_aux_losses()
++        total_loss = total_loss + self.cfg.activation_balance_weight * activation_balance_loss
++        total_loss = total_loss + self.cfg.moe_aux_loss_weight * moe_aux_loss
++
++        # Per-example refinement: the next loop is rewarded only when it beats
++        # the previous loop by at least a small margin. ReLU keeps this a soft
++        # auxiliary signal instead of forcing impossible monotonicity on every
++        # stochastic batch.
++        if self.cfg.loop_refinement_weight > 0 and primary_step_losses.size(1) > 1:
++            improvements = primary_step_losses[:, :-1] - primary_step_losses[:, 1:]
++            refinement_loss = F.relu(self.cfg.loop_refinement_margin - improvements).mean()
++        else:
++            refinement_loss = torch.zeros((), device=idx.device, dtype=primary_step_losses.dtype)
++        self.last_loop_refinement_loss = refinement_loss.detach()
++        total_loss = total_loss + self.cfg.loop_refinement_weight * refinement_loss
++
++        # Legacy batch-level monotonic penalty is kept separate and disabled
++        # by default. It remains useful for controlled ablations.
++        if self.cfg.loop_monotonic_weight > 0 and primary_step_losses.size(1) > 1:
++            mean_losses = primary_step_losses.mean(dim=0)
++            monotonic_loss = F.relu(
++                mean_losses[1:] - mean_losses[:-1] + self.cfg.loop_monotonic_margin
++            ).mean()
++        else:
++            monotonic_loss = torch.zeros((), device=idx.device, dtype=primary_step_losses.dtype)
++        self.last_loop_monotonic_loss = monotonic_loss.detach()
++        total_loss = total_loss + self.cfg.loop_monotonic_weight * monotonic_loss
++
++        total_loss = total_loss + self.cfg.loop_task_weight * loop_task_loss
++
++        return total_loss, primary_step_losses.mean(dim=0).detach()  # [T]
+ 
+     # ------------------------------------------------------------------
+     # Inference with adaptive early exit  (Ouro §3.2, Q-exit criterion)
+===== block.py =====
+--- /mnt/data/project/block(2).py	2026-08-20 06:15:38.622750971 +0000
++++ src/loop_transformer/block.py	2026-08-20 06:18:26.422820999 +0000
+@@ -131,20 +131,28 @@
+ 
+ 
+ class ExitGate(nn.Module):
+-    """
+-    Per-step instantaneous exit probability predictor (Ouro LoopLM,
+-    arXiv:2510.25741, §3.2).
++    """Per-loop instantaneous exit probability with explicit loop identity."""
+ 
+-    Instantaneous exit probability at loop step t:
+-        λ_t(x) = σ(Linear(mean-pool(h^(t))))  ∈ (0, 1)
+-
+-    These are combined via the survival model to build a proper discrete
+-    distribution over exit steps (see LoopTransformer.compute_loss).
+-    """
+-    def __init__(self, dim: int):
++    def __init__(self, dim: int, loop_embed_dim: int = 16, max_loops: int = 4):
+         super().__init__()
+-        self.proj = nn.Linear(dim, 1, bias=True)
++        self.dim = dim
++        self.loop_embed_dim = loop_embed_dim
++        self.max_loops = max_loops
++        if loop_embed_dim > 0:
++            self.loop_embedding = nn.Embedding(max_loops, loop_embed_dim)
++            nn.init.normal_(self.loop_embedding.weight, mean=0.0, std=0.02)
++            in_dim = dim + loop_embed_dim
++        else:
++            self.loop_embedding = None
++            in_dim = dim
++        self.proj = nn.Linear(in_dim, 1, bias=True)
++
++    def forward(self, h: torch.Tensor, loop_idx: int = 0) -> torch.Tensor:
++        """h: [B,T,D] -> lambda_t [B]; loop_idx is 0-based."""
++        pooled = h.mean(dim=1)
++        if self.loop_embedding is not None:
++            idx = max(0, min(int(loop_idx), self.max_loops - 1))
++            loop_vec = self.loop_embedding.weight[idx].unsqueeze(0).expand(pooled.size(0), -1)
++            pooled = torch.cat([pooled, loop_vec], dim=-1)
++        return torch.sigmoid(self.proj(pooled)).squeeze(-1)
+ 
+-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+-        """h: [B, T, D]  →  λ_t: [B]"""
+-        return torch.sigmoid(self.proj(h.mean(dim=1))).squeeze(-1)
+===== config.py =====
+--- /mnt/data/project/config(2).py	2026-08-20 06:15:38.670750973 +0000
++++ src/loop_transformer/config.py	2026-08-20 06:18:26.422683054 +0000
+@@ -89,6 +89,17 @@
+     # ordinary training noise between individual steps.
+     loop_monotonic_weight: float = 0.0
+     loop_monotonic_margin: float = 0.01
++    # New recurrent-refinement experiment knobs.
++    # Small auxiliary loss that rewards useful improvement between consecutive loops.
++    loop_refinement_weight: float = 0.02
++    loop_refinement_margin: float = 0.001
++    # Distinct sub-objective per loop: loop t predicts t+1 tokens ahead
++    # (loop 0 -> next token, loop 1 -> +2, ..., loop 3 -> +4).
++    loop_task_weight: float = 0.02
++    loop_task_mode: str = "horizon"
++    # Explicit loop identity for the exit gate. 0 disables the embedding,
++    # but the refined experiment defaults to 16 dimensions.
++    exit_gate_loop_embed_dim: int = 16
+     # ── DeepSeek attention ─────────────────────────────────────
+     csa_m:          int   = 4
+     csa_top_k:      int   = 64       # see class docstring
+@@ -242,6 +253,11 @@
+         check(self.loop_supervision_weight >= 0, f"loop_supervision_weight must be >= 0, got {self.loop_supervision_weight}")
+         check(self.loop_monotonic_weight >= 0, f"loop_monotonic_weight must be >= 0, got {self.loop_monotonic_weight}")
+         check(self.loop_monotonic_margin >= 0, f"loop_monotonic_margin must be >= 0, got {self.loop_monotonic_margin}")
++        check(self.loop_refinement_weight >= 0, f"loop_refinement_weight must be >= 0, got {self.loop_refinement_weight}")
++        check(self.loop_refinement_margin >= 0, f"loop_refinement_margin must be >= 0, got {self.loop_refinement_margin}")
++        check(self.loop_task_weight >= 0, f"loop_task_weight must be >= 0, got {self.loop_task_weight}")
++        check(self.loop_task_mode in {"horizon", "none"}, f"loop_task_mode must be 'horizon' or 'none', got {self.loop_task_mode!r}")
++        check(self.exit_gate_loop_embed_dim >= 0, f"exit_gate_loop_embed_dim must be >= 0, got {self.exit_gate_loop_embed_dim}")
+         check(self.activation_bias_update_speed >= 0, f"activation_bias_update_speed must be >= 0, got {self.activation_bias_update_speed}")
+         check(self.moe_bias_update_speed >= 0, f"moe_bias_update_speed must be >= 0, got {self.moe_bias_update_speed}")
+         check(
+===== train script =====
+--- /mnt/data/refined/train_loop_refined.py	2026-08-20 06:16:14.818752400 +0000
++++ scripts/train_refined_v2.py	2026-08-20 06:25:46.148692294 +0000
+@@ -151,6 +151,13 @@
+         "beta_entropy": args.beta_entropy,
+         "loop_supervision_weight": args.loop_supervision_weight,
+         "loop_sampling": args.loop_sampling,
++        "loop_monotonic_weight": args.loop_monotonic_weight,
++        "loop_monotonic_margin": args.loop_monotonic_margin,
++        "loop_refinement_weight": args.loop_refinement_weight,
++        "loop_refinement_margin": args.loop_refinement_margin,
++        "loop_task_weight": args.loop_task_weight,
++        "loop_task_mode": args.loop_task_mode,
++        "exit_gate_loop_embed_dim": args.exit_gate_loop_embed_dim,
+         "loop_sampling_lambda": args.loop_sampling_lambda,
+ 
+         # DeepSeek-style attention
+@@ -410,6 +417,20 @@
+     p.add_argument("--beta-entropy", type=float, default=None)
+     p.add_argument("--loop-supervision-weight", type=float, default=None,
+                     help="extra direct supervision over every executed loop; 0 preserves the original objective")
++    p.add_argument("--loop-monotonic-weight", type=float, default=None,
++                    help="soft batch-mean monotonicity penalty; 0 disables")
++    p.add_argument("--loop-monotonic-margin", type=float, default=None,
++                    help="tolerance for the monotonicity penalty")
++    p.add_argument("--loop-refinement-weight", type=float, default=None,
++                    help="per-example auxiliary loss rewarding loop-to-loop CE improvement")
++    p.add_argument("--loop-refinement-margin", type=float, default=None,
++                    help="required CE improvement before the refinement penalty becomes zero")
++    p.add_argument("--loop-task-weight", type=float, default=None,
++                    help="auxiliary weight for the distinct per-loop horizon-prediction task")
++    p.add_argument("--loop-task-mode", choices=("horizon", "none"), default=None,
++                    help="auxiliary task family used by recurrent depth")
++    p.add_argument("--exit-gate-loop-embed-dim", type=int, default=None,
++                    help="learned loop-index embedding width for exit gate")
+     p.add_argument("--loop-sampling", dest="loop_sampling",
+                     action="store_true", default=None)
+     p.add_argument("--no-loop-sampling", dest="loop_sampling",
+@@ -672,7 +693,10 @@
+                 log.info(f"  [debug] grad_norm(pre-clip)={grad_norm:.4f}  "
+                          f"csa_aux_loss={model.last_csa_aux_loss.item():.4f}  "
+                          f"activation_balance={model.last_activation_balance_loss.item():.4f}  "
+-                         f"moe_aux={model.last_moe_aux_loss.item():.4f}")
++                         f"moe_aux={model.last_moe_aux_loss.item():.4f}  "
++                         f"refinement_aux={model.last_loop_refinement_loss.item():.4f}  "
++                         f"loop_task_aux={model.last_loop_task_loss.item():.4f}  "
++                         f"monotonic_aux={model.last_loop_monotonic_loss.item():.4f}")
+                 if model.last_activation_probs is not None:
+                     log.info("  [debug] activation mean probs: " + " ".join(
+                         f"A{i}={p:.3f}" for i, p in enumerate(model.last_activation_probs.tolist())

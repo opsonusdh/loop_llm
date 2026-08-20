@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loop-transformer"
+version = "0.1.0"
+description = "DeepSeek CSA/HCA attention + Kimi Attention Residuals + Ouro LoopLM, unified in one architecture."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Subhradeep" }]
+keywords = ["transformer", "pytorch", "looped-language-model", "attention-residuals", "deep-learning"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+train = [
+    "numpy>=1.24",
+]
+scrape = [
+    "requests>=2.31",
+]
+dev = [
+    "pytest>=7.4",
+    "numpy>=1.24",
+    "requests>=2.31",
+]
+
+[project.urls]
+Repository = "https://github.com/yourusername/loop-transformer"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

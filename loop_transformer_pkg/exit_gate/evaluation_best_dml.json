@@ -1,0 +1,50 @@
+{
+  "device": "privateuseone:0",
+  "gate_checkpoint": "exit_gate\\best.pt",
+  "stage1_checkpoint": "latest.pt",
+  "checkpoint_step": 800,
+  "elapsed_seconds": 1645.630355834961,
+  "integrity": {
+    "compatible_state_keys": true,
+    "gate_tensors_changed": 2,
+    "non_gate_tensors_changed": 0,
+    "max_non_gate_abs_diff": 0.0,
+    "non_gate_unchanged": true
+  },
+  "num_batches": 100,
+  "num_examples": 300,
+  "seq_len": 320,
+  "max_loops": 4,
+  "exit_threshold": 0.8,
+  "baseline_final_loop_loss": 6.263160257339478,
+  "gated_q_exit_loss": 6.264089377721151,
+  "gated_minus_baseline_loss": 0.00092912038167281,
+  "gated_relative_loss_change_pct": 0.014834689573590604,
+  "oracle_per_example_best_loop_loss": 6.26150364557902,
+  "gated_minus_oracle_loss": 0.002585732142130759,
+  "mean_positive_transition_improvement": 0.0013443369438755326,
+  "mean_continue_target": 0.4544739112257957,
+  "mean_gated_depth": 2.41,
+  "estimated_compute_saved_pct": 39.75,
+  "mean_per_example_expected_depth_diagnostic": 1.770432744026184,
+  "mean_gate_lambda_by_loop": [
+    0.4867498642206192,
+    0.6141521418094635,
+    0.7254753559827805,
+    0.7632103455066681
+  ],
+  "exit_counts_by_loop": [
+    0,
+    177,
+    123,
+    0
+  ],
+  "exit_rates_by_loop": [
+    0.0,
+    0.59,
+    0.41,
+    0.0
+  ],
+  "loss_improvement_of_gated_vs_final_sum": -0.0009291211764017741,
+  "gated_regret_vs_oracle": 0.002585757573445638
+}
