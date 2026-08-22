@@ -47,39 +47,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import requests
-from filters import DocumentClassifier, Decision, Deduplicator
+
+ROOT = Path(__file__).resolve().parents[1] if Path(__file__).parent.name == "scripts" else Path(__file__).resolve().parent
+for _p in (ROOT / "scripts", ROOT / "src", ROOT):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+try:
+    from filters import DocumentClassifier, Decision, Deduplicator
+except ImportError as e:
+    sys.exit(
+        "This script requires filters.py (the shared corpus-quality classifier) "
+        "importable from the same directory as this script -- e.g. scripts/filters.py "
+        f"next to scripts/scrape_github.py.\nOriginal error: {e}"
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("scrape_github")
 
 API_ROOT = "https://api.github.com"
-
-# Binary/media extensions -- never useful as text training data.
-BAD_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
-    ".mp3", ".wav", ".ogg", ".flac", ".aac",
-    ".mp4", ".mkv", ".avi", ".mov", ".webm",
-    ".zip", ".7z", ".rar", ".gz", ".xz", ".bz2", ".tar",
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".obj",
-    ".pdf", ".ttf", ".woff", ".woff2", ".eot", ".class", ".jar", ".pyc",
-    ".whl", ".db", ".sqlite", ".sqlite3",
-}
-
-# Path substrings that mark vendored, generated, or build-output content --
-# technically text, but low-value and heavily duplicated across repos.
-BAD_PATH_PARTS = {
-    "node_modules/", "vendor/", "vendored/", "dist/", "build/", "target/",
-    ".git/", "__pycache__/", ".next/", ".nuxt/", "venv/", ".venv/",
-    "site-packages/", "bower_components/", "coverage/", ".pytest_cache/",
-    ".egg-info/",
-}
-
-# Lockfiles and similar: valid text, but machine-generated and extremely
-# repetitive across the entire corpus -- not useful signal for an LM.
-BAD_FILENAMES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-    "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum",
-}
 
 DEFAULT_KEYWORDS = [
     "python", "javascript", "typescript", "java", "go", "rust", "c", "cpp",
@@ -192,24 +177,20 @@ class GitHubClient:
 # Filtering
 # ======================================================================
 
-def is_candidate_path(path: str, size: int, min_size: int, max_size: int) -> bool:
-    lower = path.lower()
-    if any(lower.endswith(ext) for ext in BAD_EXTENSIONS):
-        return False
-    if any(part in path for part in BAD_PATH_PARTS):
-        return False
-    if Path(path).name in BAD_FILENAMES:
-        return False
+def is_candidate_path(path: str, size: int, min_size: int, max_size: int,
+                       classifier: DocumentClassifier) -> bool:
+    """Cheap pre-fetch gate on path/filename/extension/size alone, before
+    spending a download on the file. Filename/path/extension rules are
+    delegated to the classifier's own _path_reject (the same rules applied
+    again on content after download) instead of a second, separate copy of
+    BAD_FILENAMES/BAD_PATH_PARTS/BINARY_EXTENSIONS -- two independent lists
+    of the same thing is exactly how the corpus ended up with lockfile-
+    shaped files a stale local copy didn't know about yet."""
     if not (min_size <= size <= max_size):
         return False
+    if classifier._path_reject(path):
+        return False
     return True
-
-
-def looks_generated_or_minified(text: str, max_line_length: int = 2000) -> bool:
-    """Cheap heuristic: a single absurdly long line strongly suggests a
-    minified bundle or a generated data blob rather than hand-written
-    source -- filter these out even if the extension looked innocent."""
-    return any(len(line) > max_line_length for line in text.splitlines()[:50])
 
 
 # ======================================================================
@@ -317,7 +298,7 @@ def scrape(args: argparse.Namespace) -> None:
         files = client.get_tree(owner, name, branch)
         candidates = [
             f for f in files
-            if is_candidate_path(f["path"], f.get("size", 0), args.min_file_size, args.max_file_size)
+            if is_candidate_path(f["path"], f.get("size", 0), args.min_file_size, args.max_file_size, classifier)
         ]
         state.visited_repos.add(full_name)
 
@@ -351,7 +332,7 @@ def scrape(args: argparse.Namespace) -> None:
 
             decision, reason, stats = classifier.classify(content, path=path, source="github")
             
-            if decision.name.startswith("REJECT"):
+            if decision.value.startswith("REJECT_"):
                 state.stats["rejected"] += 1
                 state.stats["bytes_rejected"] += len(content)
                 state.stats["rejected_by_reason"][decision.value] = state.stats["rejected_by_reason"].get(decision.value, 0) + 1
