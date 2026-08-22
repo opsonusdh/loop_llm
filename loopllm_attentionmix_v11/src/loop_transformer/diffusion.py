@@ -141,3 +141,74 @@ def build_diffusion_causal_mask(
         bad = (~mask.any(dim=-1)).nonzero(as_tuple=False).flatten().tolist()
         raise RuntimeError(f"Diffusion causal mask contains all-False rows: {bad}")
     return mask
+
+
+def get_block_sigmas(
+    num_blocks: int,
+    *,
+    sigma_min: float = 0.002,
+    sigma_max: float = 80.0,
+    p_mean: float = -1.2,
+    p_std: float = 1.2,
+) -> torch.Tensor:
+    """Return B+1 sigma boundaries matching SakanaAI DiffusionBlocks.
+
+    The boundaries divide the truncated log-normal training distribution into
+    equal probability mass intervals. This is adapted directly from the
+    official implementation's get_block_sigmas().
+    """
+    if num_blocks < 1:
+        raise ValueError("num_blocks must be >= 1")
+    if not (0.0 < sigma_min < sigma_max):
+        raise ValueError("require 0 < sigma_min < sigma_max")
+    if p_std <= 0:
+        raise ValueError("p_std must be > 0")
+    normal = torch.distributions.Normal(0.0, 1.0)
+    log_min = torch.log(torch.tensor(sigma_min, dtype=torch.float64))
+    log_max = torch.log(torch.tensor(sigma_max, dtype=torch.float64))
+    cdf_min = normal.cdf((log_min - p_mean) / p_std)
+    cdf_max = normal.cdf((log_max - p_mean) / p_std)
+    points = torch.linspace(0.0, 1.0, num_blocks + 1, dtype=torch.float64)
+    cdf = cdf_min + (cdf_max - cdf_min) * points
+    values = torch.exp(p_mean + p_std * normal.icdf(cdf))
+    values[0] = sigma_min
+    values[-1] = sigma_max
+    return values.to(torch.float32)
+
+
+def sample_block_sigma(
+    num_blocks: int,
+    *,
+    sigma_min: float,
+    sigma_max: float,
+    p_mean: float,
+    p_std: float,
+    block_gamma: float = 0.0,
+    device: torch.device,
+) -> tuple[int, torch.Tensor, torch.Tensor]:
+    """Sample one whole batch from a single block's sigma interval.
+
+    Sakana's reference implementation samples one block per training step and
+    then samples sigma inside that block's probability-mass interval. Using a
+    single block for the entire batch keeps execution branch-free and ensures
+    only one block receives gradients in the update.
+    """
+    boundaries = get_block_sigmas(
+        num_blocks, sigma_min=sigma_min, sigma_max=sigma_max,
+        p_mean=p_mean, p_std=p_std,
+    ).to(device)
+    block_idx = int(torch.randint(num_blocks, (), device=device).item())
+    lo = float(boundaries[block_idx].item())
+    hi = float(boundaries[block_idx + 1].item())
+    if block_gamma > 0.0:
+        log_lo = torch.log(torch.tensor(lo, device=device))
+        log_hi = torch.log(torch.tensor(hi, device=device))
+        span = log_hi - log_lo
+        lo = max(sigma_min, float(torch.exp(log_lo - block_gamma * span).item()))
+        hi = min(sigma_max, float(torch.exp(log_hi + block_gamma * span).item()))
+    normal = torch.distributions.Normal(0.0, 1.0)
+    cdf_lo = normal.cdf((torch.log(torch.tensor(lo, device=device)) - p_mean) / p_std)
+    cdf_hi = normal.cdf((torch.log(torch.tensor(hi, device=device)) - p_mean) / p_std)
+    u = torch.rand((), device=device) * (cdf_hi - cdf_lo) + cdf_lo
+    sigma = torch.exp(torch.tensor(p_mean, device=device) + p_std * normal.icdf(u))
+    return block_idx, sigma, boundaries

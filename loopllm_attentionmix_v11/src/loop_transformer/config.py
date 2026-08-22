@@ -117,6 +117,10 @@ class LoopConfig:
     diffusion_loss_weight: float = 1.0
     diffusion_normalize_embeddings: bool = True
     diffusion_cond_dim: int = 128
+    # True Sakana-style block-wise training: partition physical layers into
+    # independently trainable contiguous blocks and train one block per update.
+    diffusion_num_blocks: int = 1
+    diffusion_block_gamma: float = 0.0
     # ── Mixture attention / contextual routing ─────────────────
     attention_mixture: bool = True
     attention_mixture_top_k: int = 1
@@ -306,6 +310,13 @@ class LoopConfig:
         check(self.diffusion_sigma_data > 0, f"diffusion_sigma_data must be > 0, got {self.diffusion_sigma_data}")
         check(self.diffusion_loss_weight >= 0, f"diffusion_loss_weight must be >= 0, got {self.diffusion_loss_weight}")
         check(self.diffusion_cond_dim > 0, f"diffusion_cond_dim must be > 0, got {self.diffusion_cond_dim}")
+        check(1 <= self.diffusion_num_blocks <= self.n_layers,
+              f"diffusion_num_blocks must be in [1, n_layers], got {self.diffusion_num_blocks}")
+        if self.diffusion_blocks:
+            check(self.n_layers % self.diffusion_num_blocks == 0,
+                  f"n_layers ({self.n_layers}) must be divisible by diffusion_num_blocks ({self.diffusion_num_blocks}) when diffusion_blocks=True")
+        check(self.diffusion_block_gamma >= 0,
+              f"diffusion_block_gamma must be >= 0, got {self.diffusion_block_gamma}")
         check(not self.diffusion_blocks or self.max_loops >= 1, "diffusion_blocks requires max_loops >= 1")
         check(self.training_mode == "recurrent" or self.diffusion_blocks, "training_mode diffusion/hybrid requires diffusion_blocks=True")
         check(0.0 <= self.activation_min_probability < 0.25, f"activation_min_probability must be in [0, 0.25), got {self.activation_min_probability}")

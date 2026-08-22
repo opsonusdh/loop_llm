@@ -1,104 +1,47 @@
-# DiffusionBlocks mode for LoopLLM
+# DiffusionBlocks: true block-wise training
 
-This repository now contains an **optional DiffusionBlocks recurrent-depth training mode** based on Sakana AI's DiffusionBlocks paper.
+This repository uses the Sakana AI DiffusionBlocks idea in its **block-wise** form for Stage-I diffusion updates. The implementation is an adaptation to the LoopTransformer architecture.
 
-The key point is that this is the **recurrent-depth adaptation**, not the paper's separate 4-block AR Transformer recipe. In the paper, recurrent-depth models are treated as one denoiser `D_theta(z_sigma, x, sigma)` and trained with **one recurrent forward pass per update**; the original multi-iteration recurrence is retained for inference. The paper reports this on Huginn and reports lower training computation from avoiding BPTT through the recurrent iterations. See Section 5.5 / Appendix E.5. 
+## What changed
 
-## What the implementation adds
+The physical Transformer layers are partitioned into contiguous blocks. For a 6-layer model with `--diffusion-num-blocks 3`, the partition is:
 
-- EDM-style log-normal sigma sampling, with the paper defaults:
-  - `P_mean=-1.2`
-  - `P_std=1.2`
-  - `sigma_min=0.002`
-  - `sigma_max=80`
-  - `sigma_data=0.5`
-- EDM input/output preconditioning and loss weighting.
-- Continuous sigma conditioning injected into both attention and FFN sub-layer normalization paths.
-- One recurrent pass per DiffusionBlocks training step.
-- Clean current-token context plus a noisy next-token latent target, so the objective remains autoregressive at the token level.
-- L2-normalized embeddings in diffusion mode, matching the paper's recommendation for discrete outputs.
-- Deterministic multi-sigma validation metrics that report both raw token CE and the weighted diffusion objective.
-- Experimental Euler-style denoising generation through `scripts/generate_diffusionblocks.py`.
-
-## Important separation
-
-Normal LoopLM training and inference are unchanged when `diffusion_blocks=False`.
-
-DiffusionBlocks training is a **Stage-I alternative**. Do not resume an ordinary LoopLM checkpoint into DiffusionBlocks mode. Train a fresh Stage-I checkpoint for this mode.
-
-The existing Stage-II exit gate should also be treated as a separate experiment. Its current targets were learned from ordinary loop trajectories, not diffusion denoising trajectories, so it should be retrained after a successful diffusion Stage-I run.
-
-## Real-data Colab command
-
-Use the same model dimensions you have been using, but start a **fresh checkpoint directory**:
-
-```bash
-python -m scripts.train_refined_v2 \
-    --train-data train.bin \
-    --val-data train.val.bin \
-    --data-dtype uint16 \
-    --vocab-size 50281 \
-    --dim 512 \
-    --n-layers 6 \
-    --n-heads 8 \
-    --head-dim 64 \
-    --ffn-hidden-dim 2048 \
-    --rope-dim 64 \
-    --max-loops 4 \
-    --min-loops 1 \
-    --no-loop-sampling \
-    --csa-m 4 \
-    --csa-top-k 128 \
-    --csa-aux-loss-weight 1.0 \
-    --hca-m-prime 256 \
-    --sw-window 256 \
-    --groups 8 \
-    --group-dim 64 \
-    --moe-num-shared-experts 1 \
-    --moe-num-routed-experts 4 \
-    --moe-top-k 2 \
-    --activation-top-k 2 \
-    --activation-balance-weight 0.01 \
-    --moe-aux-loss-weight 0.01 \
-    --tie-embeddings \
-    --grad-checkpointing \
-    --diffusion-blocks \
-    --diffusion-cond-dim 128 \
-    --diffusion-sigma-min 0.002 \
-    --diffusion-sigma-max 80 \
-    --diffusion-p-mean -1.2 \
-    --diffusion-p-std 1.2 \
-    --diffusion-sigma-data 0.5 \
-    --diffusion-loss-weight 1.0 \
-    --diffusion-normalize-embeddings \
-    --batch-size 2 \
-    --seq-len 320 \
-    --max-steps 5000 \
-    --dtype float32 \
-    --lr 3e-4 \
-    --warmup-steps 200 \
-    --checkpoint-dir /content/drive/MyDrive/loop_llm_diffusionblocks \
-    --checkpoint-interval 100 \
-    --eval-interval 100 \
-    --eval-iters 20 \
-    --log-interval 10 \
-    --debug \
-    --colab
+```text
+Block 0: layers 0-1
+Block 1: layers 2-3
+Block 2: layers 4-5
 ```
 
-For the first real run, keep the checkpoint directory separate from the existing Stage-I run so the experiments stay comparable.
+A diffusion training step samples **one block for the entire batch**, samples sigma from that block's dedicated log-normal interval, runs only that block, and backpropagates through that block. Prefix and suffix physical layers are not executed, so their activations are not part of the diffusion autograd graph.
 
-## Experimental generation
+This is the key memory-saving property described by Sakana AI: split the network into B blocks, assign each block a noise range, condition each block on its range, and train one block per iteration. The official implementation samples one block per training step and uses block-specific sigma intervals.
 
-```bash
-python -m scripts.generate_diffusionblocks \
-    --checkpoint /content/drive/MyDrive/loop_llm_diffusionblocks/latest.pt \
-    --prompt "def fibonacci(n):" \
-    --device cuda \
-    --steps 4 \
-    --max-new-tokens 100 \
-    --temperature 0.8 \
-    --top-k 50
+## LoopTransformer-specific adaptation
+
+The normal inference architecture remains unchanged:
+
+```text
+shared 6-layer stack -> repeated for 4 recurrent loops
 ```
 
-This generation path is experimental. The ordinary LoopLM generator remains the reference inference path for non-diffusion checkpoints.
+The block-wise diffusion path is a **training-only objective**. It uses the existing attention/FFN/router parameters of the selected physical layer block plus the shared diffusion conditioning/output machinery. It does not replace the ordinary recurrent inference path.
+
+Because LoopTransformer uses `LoopedAttnRes`, the selected layers use a local block-scoped residual-attention view during diffusion training rather than pretending that uncomputed prefix/suffix sublayers exist. This keeps the training graph self-contained while preserving the same physical `TransformerBlock` implementations, routing, and diffusion FiLM conditioning.
+
+## Default for the compact 6-layer model
+
+Use:
+
+```text
+--diffusion-num-blocks 3
+```
+
+so each diffusion block contains two physical Transformer layers. For architectures where `n_layers` is not divisible by the requested number of blocks, configuration validation fails early rather than silently creating uneven blocks.
+
+## Hybrid training
+
+`training_mode=hybrid` alternates between the normal recurrent objective and this block-wise diffusion objective. The two graphs are never accumulated together.
+
+## Important distinction
+
+This is different from the older recurrent-depth diffusion path that ran the entire Transformer once on every diffusion update. That older path reduced recurrent depth but did **not** provide the block-wise activation-memory reduction. The current implementation is intentionally block-wise.

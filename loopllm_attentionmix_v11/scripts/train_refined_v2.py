@@ -194,6 +194,8 @@ def build_config(args: argparse.Namespace) -> LoopConfig:
         "diffusion_loss_weight": args.diffusion_loss_weight,
         "diffusion_normalize_embeddings": args.diffusion_normalize_embeddings,
         "diffusion_cond_dim": args.diffusion_cond_dim,
+        "diffusion_num_blocks": args.diffusion_num_blocks,
+        "diffusion_block_gamma": args.diffusion_block_gamma,
 
         # Mixture of attention experts / contextual routing
         "attention_mixture": args.attention_mixture,
@@ -508,6 +510,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion-normalize-embeddings", dest="diffusion_normalize_embeddings", action="store_true", default=None)
     p.add_argument("--no-diffusion-normalize-embeddings", dest="diffusion_normalize_embeddings", action="store_false")
     p.add_argument("--diffusion-cond-dim", type=int, default=None)
+    p.add_argument("--diffusion-num-blocks", type=int, default=None,
+                   help="number of contiguous physical layer blocks for true block-wise DiffusionBlocks training")
+    p.add_argument("--diffusion-block-gamma", type=float, default=None,
+                   help="sigma-range extension factor around each block interval")
 
     # Mixture of attention experts / contextual routing
     p.add_argument("--attention-mixture", dest="attention_mixture", action="store_true", default=None,
@@ -660,7 +666,7 @@ def main() -> None:
              + (f"   Val tokens: {len(val_data):,}" if val_data is not None else "   (no val set)"))
 
     cfg = build_config(args)
-    # ``--diffusion-blocks`` selects the DiffusionBlocks recurrent-depth
+    # ``--diffusion-blocks`` selects true Sakana-style block-wise
     # objective unless the caller explicitly asks for another composed mode.
     # The previous implementation left training_mode at its dataclass default
     # (recurrent), which silently ignored the diffusion objective in the main
@@ -675,8 +681,8 @@ def main() -> None:
             log.info("DiffusionBlocks mode: forcing loop_sampling=False because training is single-pass.")
             cfg.loop_sampling = False
         log.info(
-            "DiffusionBlocks mode: one recurrent pass per training step; normal %d-loop inference is preserved.",
-            cfg.max_loops,
+            "DiffusionBlocks mode: true block-wise training with %d physical blocks; normal %d-loop inference is preserved.",
+            cfg.diffusion_num_blocks, cfg.max_loops,
         )
     log.info(f"Config: {cfg}")
 
@@ -821,7 +827,8 @@ def main() -> None:
                         f"  [debug] grad_norm(pre-clip)={grad_norm:.4f}  "
                         f"csa_aux_loss={model.last_csa_aux_loss.item():.4f}  "
                         f"activation_balance={model.last_activation_balance_loss.item():.4f}  "
-                        f"moe_aux={model.last_moe_aux_loss.item():.4f}"
+                        f"moe_aux={model.last_moe_aux_loss.item():.4f}  "
+                        f"diffusion_block={getattr(model, 'last_diffusion_block_idx', -1)}"
                     )
                 else:
                     log.info(f"  [debug] grad_norm(pre-clip)={grad_norm:.4f}  "

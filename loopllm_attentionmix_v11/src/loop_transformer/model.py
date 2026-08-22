@@ -37,7 +37,7 @@ from .attnres import LoopedAttnRes
 from .block import ExitGate, TransformerBlock
 from .config import LoopConfig
 from .layers import RMSNorm, safe_eps
-from .diffusion import build_diffusion_causal_mask, edm_preconditioning, log_sigma_embedding, sample_log_normal_sigma
+from .diffusion import build_diffusion_causal_mask, edm_preconditioning, log_sigma_embedding, sample_log_normal_sigma, sample_block_sigma
 from .recurrent_depth import RecurrentDepthController
 
 
@@ -327,21 +327,104 @@ class LoopTransformer(nn.Module):
         *,
         noisy_time_offset: int = 0,
     ) -> torch.Tensor:
-        """One D_theta(z_sigma, x, sigma) call with a strict clean/noisy mask.
+        """Compatibility denoiser for diffusion generation/evaluation.
 
-        The Transformer sees ``[clean context, noisy targets]`` as one sequence.
-        The noisy positions may read only their allowed clean predecessors and
-        their own noisy latent. This is especially important for CSA/HCA because
-        their compressed/local candidate sets must inherit the same visibility
-        relation without ever creating an all-masked query.
+        Training uses the true block-wise path below. Generation keeps a full
+        denoising pass over the model so the deployed recurrent architecture is
+        not accidentally replaced by the training-only block decomposition.
         """
-        if not self.cfg.diffusion_blocks:
-            raise RuntimeError("DiffusionBlocks conditioning is disabled")
-        B = idx.size(0)
         clean = self.tok_emb(idx)
         if self.embed_proj_in is not None:
             clean = self.embed_proj_in(clean)
-        clean = F.normalize(clean, dim=-1) if self.cfg.diffusion_normalize_embeddings else clean
+        if self.cfg.diffusion_normalize_embeddings:
+            clean = F.normalize(clean, dim=-1)
+        edm = edm_preconditioning(sigma, sigma_data=self.cfg.diffusion_sigma_data)
+        z_in = edm.c_in[:, None, None] * z_sigma
+        raw_time = log_sigma_embedding(edm.c_noise, self.cfg.diffusion_cond_dim)
+        assert self.diffusion_time_mlp is not None
+        time_cond = self.diffusion_time_mlp(raw_time)
+        combined = torch.cat([clean, z_in], dim=1)
+        mask = build_diffusion_causal_mask(
+            clean.size(1), z_in.size(1),
+            noisy_time_offset=noisy_time_offset, device=combined.device,
+        )
+        self._clear_csa_aux_losses()
+        self._clear_ffn_aux_losses()
+        delta = self._one_loop(
+            [combined], loop_idx=0, diffusion_cond=time_cond,
+            initial_partial=None, attention_mask=mask,
+        )
+        pred_delta = self.final_norm(delta[:, clean.size(1):])
+        pred = edm.c_skip[:, None, None] * z_sigma + edm.c_out[:, None, None] * pred_delta
+        if self.cfg.diffusion_normalize_embeddings:
+            pred = F.normalize(pred, dim=-1)
+        return pred
+
+    def _diffusion_block_ranges(self) -> list[tuple[int, int]]:
+        """Return contiguous physical layer ranges for true DiffusionBlocks training."""
+        B = self.cfg.diffusion_num_blocks
+        if self.cfg.n_layers % B != 0:
+            raise RuntimeError(
+                f"n_layers={self.cfg.n_layers} must be divisible by "
+                f"diffusion_num_blocks={B}"
+            )
+        width = self.cfg.n_layers // B
+        return [(i * width, (i + 1) * width) for i in range(B)]
+
+    def _diffusion_block_impl(
+        self,
+        x: torch.Tensor,
+        block_idx: int,
+        diffusion_cond: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run exactly one physical DiffusionBlock with local depth residuals.
+
+        This intentionally does NOT execute prefix/suffix Transformer layers.
+        The selected block receives the common noisy/clean input representation,
+        matching the independently-trainable block formulation from Sakana's
+        DiffusionBlocks. Only the selected block and shared output/conditioning
+        modules participate in autograd for this update.
+        """
+        ranges = self._diffusion_block_ranges()
+        start_layer, end_layer = ranges[block_idx]
+        partial: Optional[torch.Tensor] = None
+        local_blocks = [x]
+
+        for i in range(start_layer, end_layer):
+            pos_attn = 2 * i
+            pos_ffn = 2 * i + 1
+            h_in = self.depth_attn.compute_input(pos_attn, local_blocks, partial)
+            attn_out = self.blocks[i].forward_attn(
+                h_in, loop_idx=block_idx, diffusion_cond=diffusion_cond,
+                attention_mask=attention_mask,
+            )
+            partial = attn_out if partial is None else partial + attn_out
+            h_in = self.depth_attn.compute_input(pos_ffn, local_blocks, partial)
+            ffn_out = self.blocks[i].forward_ffn(
+                h_in, loop_idx=block_idx, diffusion_cond=diffusion_cond
+            )
+            partial = partial + ffn_out
+
+        if partial is None:
+            raise RuntimeError(f"Diffusion block {block_idx} contains no layers")
+        return self.depth_attn.compute_output([x, partial])
+
+    def _diffusion_denoise_blockwise(
+        self,
+        idx: torch.Tensor,
+        z_sigma: torch.Tensor,
+        sigma: torch.Tensor,
+        block_idx: int,
+        *,
+        noisy_time_offset: int = 0,
+    ) -> torch.Tensor:
+        """Run one selected physical Transformer block, not the full stack."""
+        clean = self.tok_emb(idx)
+        if self.embed_proj_in is not None:
+            clean = self.embed_proj_in(clean)
+        if self.cfg.diffusion_normalize_embeddings:
+            clean = F.normalize(clean, dim=-1)
 
         edm = edm_preconditioning(sigma, sigma_data=self.cfg.diffusion_sigma_data)
         z_in = edm.c_in[:, None, None] * z_sigma
@@ -355,15 +438,22 @@ class LoopTransformer(nn.Module):
             noisy_time_offset=noisy_time_offset,
             device=combined.device,
         )
+
         self._clear_csa_aux_losses()
         self._clear_ffn_aux_losses()
-        delta = self._one_loop(
-            [combined],
-            loop_idx=0,
-            diffusion_cond=time_cond,
-            initial_partial=None,
-            attention_mask=mask,
-        )
+        if self.cfg.grad_checkpointing and self.training:
+            delta = grad_checkpoint(
+                lambda inp, cond, attn_mask: self._diffusion_block_impl(
+                    inp, block_idx, cond, attn_mask
+                ),
+                combined, time_cond, mask,
+                use_reentrant=False,
+            )
+        else:
+            delta = self._diffusion_block_impl(
+                combined, block_idx, time_cond, mask
+            )
+
         pred_delta = self.final_norm(delta[:, clean.size(1):])
         pred = edm.c_skip[:, None, None] * z_sigma + edm.c_out[:, None, None] * pred_delta
         if self.cfg.diffusion_normalize_embeddings:
@@ -374,15 +464,16 @@ class LoopTransformer(nn.Module):
         self,
         idx: torch.Tensor,
         sigma_override: Optional[torch.Tensor] = None,
+        block_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Single-pass recurrent-depth DiffusionBlocks training objective.
+        """True Sakana-style block-wise DiffusionBlocks objective.
 
-        This is the recurrent-depth adaptation from DiffusionBlocks rather than
-        the separate 4-block AR Transformer recipe.  The input sequence x is
-        the clean current-token context, while the target sequence y is the
-        next-token embedding sequence.  The recurrent network receives a noisy
-        target latent z_sigma and clean x, plus continuous noise-level
-        conditioning, then performs exactly ONE recurrent pass.
+        Training samples ONE physical block per optimizer update. The model
+        is partitioned into `diffusion_num_blocks` contiguous layer groups;
+        only the selected group's activations are tracked by autograd. A
+        single batch-wide sigma is sampled from that block's dedicated
+        log-normal interval. Inference remains the ordinary full Transformer
+        and therefore still runs all configured recurrent loops.
         """
         if not self.cfg.diffusion_blocks:
             raise RuntimeError("diffusion_blocks_loss requires cfg.diffusion_blocks=True")
@@ -398,30 +489,45 @@ class LoopTransformer(nn.Module):
         if self.cfg.diffusion_normalize_embeddings:
             target_emb = F.normalize(target_emb, dim=-1)
 
-        if sigma_override is None:
-            sigma = sample_log_normal_sigma(
-                B,
-                device=idx.device,
-                p_mean=self.cfg.diffusion_p_mean,
-                p_std=self.cfg.diffusion_p_std,
+        if block_override is None:
+            block_idx, sigma_scalar, boundaries = sample_block_sigma(
+                self.cfg.diffusion_num_blocks,
                 sigma_min=self.cfg.diffusion_sigma_min,
                 sigma_max=self.cfg.diffusion_sigma_max,
+                p_mean=self.cfg.diffusion_p_mean,
+                p_std=self.cfg.diffusion_p_std,
+                block_gamma=self.cfg.diffusion_block_gamma,
+                device=idx.device,
             )
         else:
-            if sigma_override.ndim == 0:
-                sigma = sigma_override.expand(B)
-            elif sigma_override.shape == (B,):
-                sigma = sigma_override
-            else:
-                raise ValueError(f"sigma_override must be scalar or [B], got {tuple(sigma_override.shape)}")
-            sigma = sigma.to(device=idx.device, dtype=torch.float32).clone().clamp_(
-                min=self.cfg.diffusion_sigma_min, max=self.cfg.diffusion_sigma_max
+            block_idx = int(block_override)
+            if not 0 <= block_idx < self.cfg.diffusion_num_blocks:
+                raise ValueError("block_override out of range")
+            _, sigma_scalar, boundaries = sample_block_sigma(
+                self.cfg.diffusion_num_blocks,
+                sigma_min=self.cfg.diffusion_sigma_min,
+                sigma_max=self.cfg.diffusion_sigma_max,
+                p_mean=self.cfg.diffusion_p_mean,
+                p_std=self.cfg.diffusion_p_std,
+                block_gamma=self.cfg.diffusion_block_gamma,
+                device=idx.device,
             )
+            # Replace with a sample from the requested block interval.
+            lo = float(boundaries[block_idx].item())
+            hi = float(boundaries[block_idx + 1].item())
+            normal = torch.distributions.Normal(0.0, 1.0)
+            cdf_lo = normal.cdf((torch.log(torch.tensor(lo, device=idx.device)) - self.cfg.diffusion_p_mean) / self.cfg.diffusion_p_std)
+            cdf_hi = normal.cdf((torch.log(torch.tensor(hi, device=idx.device)) - self.cfg.diffusion_p_mean) / self.cfg.diffusion_p_std)
+            u = torch.rand((), device=idx.device) * (cdf_hi - cdf_lo) + cdf_lo
+            sigma_scalar = torch.exp(torch.tensor(self.cfg.diffusion_p_mean, device=idx.device) + self.cfg.diffusion_p_std * normal.icdf(u))
 
+        sigma = sigma_scalar.to(device=idx.device, dtype=torch.float32).expand(B)
         edm = edm_preconditioning(sigma, sigma_data=self.cfg.diffusion_sigma_data)
         z_sigma = target_emb + sigma[:, None, None] * torch.randn_like(target_emb)
-        pred = self._diffusion_denoise_once(context_ids, z_sigma, sigma)
-        self.last_attention_routing = self._collect_attention_routing_debug()
+        pred = self._diffusion_denoise_blockwise(
+            context_ids, z_sigma, sigma, block_idx,
+        )
+
         pre_logits = self.embed_proj_out(pred) if self.embed_proj_out is not None else pred
         logits = self.lm_head(pre_logits)
         ce = F.cross_entropy(
@@ -436,12 +542,17 @@ class LoopTransformer(nn.Module):
         attention_mixture_aux = self._collect_attention_mixture_aux()
         self.last_attention_mixture_loss = attention_mixture_aux.detach()
         activation_aux, moe_aux = self._collect_ffn_aux_losses()
+        self.last_activation_balance_loss = activation_aux.detach()
+        self.last_moe_aux_loss = moe_aux.detach()
         total = self.cfg.diffusion_loss_weight * weighted_ce
         total = total + self.cfg.csa_aux_loss_weight * csa_aux
         total = total + attention_mixture_aux
         total = total + self.cfg.activation_balance_weight * activation_aux
         total = total + self.cfg.moe_aux_loss_weight * moe_aux
 
+        self.last_diffusion_block_idx = int(block_idx)
+        self.last_diffusion_block_boundaries = boundaries.detach()
+        self.last_attention_routing = self._collect_attention_routing_debug()
         info = {
             "loss": total.detach(),
             "ce": ce.mean().detach(),
@@ -449,13 +560,14 @@ class LoopTransformer(nn.Module):
             "mean_sigma": sigma.mean().detach(),
             "min_sigma": sigma.min().detach(),
             "max_sigma": sigma.max().detach(),
+            "block_idx": torch.tensor(block_idx, device=idx.device),
+            "num_blocks": torch.tensor(self.cfg.diffusion_num_blocks, device=idx.device),
             "csa_aux": csa_aux.detach(),
             "activation_aux": activation_aux.detach(),
             "moe_aux": moe_aux.detach(),
         }
         return total, info
 
-    @torch.no_grad()
     def diffusion_euler_sample(
         self,
         idx: torch.Tensor,
@@ -732,11 +844,10 @@ class LoopTransformer(nn.Module):
                 module._clear_routing_diagnostics()
 
     def hybrid_loss(self, idx: torch.Tensor, *, diffusion_probability: Optional[float] = None) -> Tuple[torch.Tensor, Dict[str, object]]:
-        """Memory-safe unified objective: choose recurrent or diffusion training per step.
+        """Unified objective: choose recurrent or block-wise diffusion training per step.
 
-        We deliberately alternate objectives rather than summing their graphs.
-        That keeps the 15 GB Colab use-case practical while both objectives train
-        the exact same parameter set. The choice is logged for reproducibility.
+        The diffusion branch trains exactly one physical layer block per update;
+        it does not build a full-depth diffusion autograd graph.
         """
         p = self.cfg.hybrid_diffusion_probability if diffusion_probability is None else float(diffusion_probability)
         if not 0.0 <= p <= 1.0:
