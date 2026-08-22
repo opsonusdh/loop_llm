@@ -231,6 +231,7 @@ def build_config(args: argparse.Namespace) -> LoopConfig:
         # Parameter sharing / memory
         "tie_embeddings": args.tie_embeddings,
         "grad_checkpointing": args.grad_checkpointing,
+        "dropout": args.dropout,
     }
     for k, v in cli_fields.items():
         if v is not None:
@@ -557,6 +558,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--moe-aux-loss-weight", type=float, default=None)
     p.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true", default=None)
     p.add_argument("--no-tie-embeddings", dest="tie_embeddings", action="store_false")
+    p.add_argument("--dropout", type=float, default=None,
+                    help="dropout probability on attention/FFN residual branches (LoopConfig default: 0.0)")
     p.add_argument("--grad-checkpointing", dest="grad_checkpointing", action="store_true", default=None,
                     help="trade compute for ~max_loops-fold less activation memory")
     p.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false",

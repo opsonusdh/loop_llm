@@ -63,11 +63,16 @@ class TransformerBlock(nn.Module):
         attention_mixture_diversity_weight: float = 0.001,
         attention_mixture_min_probability: float = 0.10,
         attention_mixture_balance_tolerance: float = 0.25,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn_norm = RMSNorm(dim)
         self.ffn_norm  = RMSNorm(dim)
+        # Standard Transformer residual-branch dropout. Because residuals
+        # are owned by LoopedAttnRes, dropout is applied to the raw sub-layer
+        # delta immediately before the caller adds that delta.
+        self.dropout = nn.Dropout(dropout)
 
         base_swa = SlidingWindowAttention(dim, n_heads, head_dim,
                                            window_size=sw_window, rope_dim=rope_dim,
@@ -198,7 +203,7 @@ class TransformerBlock(nn.Module):
             self.attn_norm(x), loop_idx, self.attn_loop_scale, self.attn_loop_bias,
             diffusion_cond, self.diff_attn_mod,
         )
-        return self.attn(h, loop_idx=loop_idx, attention_mask=attention_mask)
+        return self.dropout(self.attn(h, loop_idx=loop_idx, attention_mask=attention_mask))
 
     def collect_attention_aux(self) -> torch.Tensor:
         if isinstance(self.attn, AttentionExpertMixture):
@@ -218,7 +223,7 @@ class TransformerBlock(nn.Module):
             self.ffn_norm(x), loop_idx, self.ffn_loop_scale, self.ffn_loop_bias,
             diffusion_cond, self.diff_ffn_mod,
         )
-        return self.ffn(h, loop_idx=loop_idx)
+        return self.dropout(self.ffn(h, loop_idx=loop_idx))
 
 
 class ExitGate(nn.Module):

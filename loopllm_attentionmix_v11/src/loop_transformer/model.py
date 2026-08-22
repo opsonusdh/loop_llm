@@ -103,6 +103,7 @@ class LoopTransformer(nn.Module):
                 attention_mixture_diversity_weight=cfg.attention_mixture_diversity_weight,
                 attention_mixture_min_probability=cfg.attention_mixture_min_probability,
                 attention_mixture_balance_tolerance=cfg.attention_mixture_balance_tolerance,
+                dropout=cfg.dropout,
             )
             for i in range(cfg.n_layers)
         ])

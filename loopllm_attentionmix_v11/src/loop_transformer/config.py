@@ -165,6 +165,7 @@ class LoopConfig:
                                       # 38M params at vocab=50k, dim=768).
                                       # Standard practice; no known downside
                                       # for this use case.
+    dropout:            float = 0.0  # residual-branch dropout; 0 preserves legacy behavior
     grad_checkpointing: bool = False # recompute each loop's activations
                                       # during backward instead of storing
                                       # them -- trades compute for ~max_loops-
